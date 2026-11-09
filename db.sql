@@ -1,0 +1,266 @@
+-- StayHaven Marketplace Database Schema
+-- Compatible with MySQL 8.0+ / phpMyAdmin import
+
+SET FOREIGN_KEY_CHECKS = 0;
+
+DROP TABLE IF EXISTS reviews;
+DROP TABLE IF EXISTS bookings;
+DROP TABLE IF EXISTS favorites;
+DROP TABLE IF EXISTS listing_amenities;
+DROP TABLE IF EXISTS amenities;
+DROP TABLE IF EXISTS listing_images;
+DROP TABLE IF EXISTS listings;
+DROP TABLE IF EXISTS users;
+
+SET FOREIGN_KEY_CHECKS = 1;
+
+CREATE TABLE users (
+    id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+    first_name    VARCHAR(80)  NOT NULL,
+    last_name     VARCHAR(80)  NOT NULL,
+    email         VARCHAR(255) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    phone         VARCHAR(32)  NULL,
+    role          ENUM('user','host','admin') NOT NULL DEFAULT 'user',
+    avatar_url    VARCHAR(512) NULL,
+    stripe_account_id            VARCHAR(255) NULL,
+    stripe_onboarding_completed  BOOLEAN NOT NULL DEFAULT FALSE,
+    stripe_charges_enabled       BOOLEAN NOT NULL DEFAULT FALSE,
+    stripe_payouts_enabled       BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_users_email (email),
+    INDEX idx_users_role (role)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE listings (
+    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+    owner_id        BIGINT NOT NULL,
+    title           VARCHAR(200) NOT NULL,
+    description     TEXT NULL,
+    country         VARCHAR(100) NOT NULL,
+    city            VARCHAR(100) NOT NULL,
+    address         VARCHAR(255) NOT NULL,
+    latitude        DECIMAL(10,7) NULL,
+    longitude       DECIMAL(10,7) NULL,
+    price_per_night DECIMAL(10,2) NOT NULL DEFAULT 0,
+    cleaning_fee    DECIMAL(10,2) NOT NULL DEFAULT 0,
+    service_fee     DECIMAL(10,2) NOT NULL DEFAULT 0,
+    max_guests      INT NOT NULL DEFAULT 1,
+    bedrooms        INT NOT NULL DEFAULT 0,
+    beds            INT NOT NULL DEFAULT 0,
+    bathrooms       INT NOT NULL DEFAULT 0,
+    property_type   ENUM('apartment','house','cabin','villa','loft','studio','cottage','chalet') NOT NULL DEFAULT 'apartment',
+    status          ENUM('draft','published','unpublished') NOT NULL DEFAULT 'draft',
+    stripe_connected_account_id VARCHAR(255) NULL,
+    created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_listings_owner FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_listings_city (city),
+    INDEX idx_listings_status (status),
+    INDEX idx_listings_type (property_type),
+    INDEX idx_listings_price (price_per_night),
+    INDEX idx_listings_owner (owner_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE listing_images (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    listing_id  BIGINT NOT NULL,
+    image_url   VARCHAR(512) NOT NULL,
+    position    INT NOT NULL DEFAULT 0,
+    created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_images_listing FOREIGN KEY (listing_id) REFERENCES listings(id) ON DELETE CASCADE,
+    INDEX idx_images_listing (listing_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE amenities (
+    id      BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name    VARCHAR(80) NOT NULL UNIQUE,
+    icon    VARCHAR(60) NOT NULL DEFAULT 'check'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE listing_amenities (
+    listing_id  BIGINT NOT NULL,
+    amenity_id  BIGINT NOT NULL,
+    PRIMARY KEY (listing_id, amenity_id),
+    CONSTRAINT fk_la_listing FOREIGN KEY (listing_id) REFERENCES listings(id) ON DELETE CASCADE,
+    CONSTRAINT fk_la_amenity FOREIGN KEY (amenity_id) REFERENCES amenities(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE favorites (
+    user_id     BIGINT NOT NULL,
+    listing_id  BIGINT NOT NULL,
+    created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, listing_id),
+    CONSTRAINT fk_fav_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT fk_fav_listing FOREIGN KEY (listing_id) REFERENCES listings(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE bookings (
+    id                          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id                     BIGINT NOT NULL,
+    listing_id                  BIGINT NOT NULL,
+    check_in                    DATE NOT NULL,
+    check_out                   DATE NOT NULL,
+    guests                      INT NOT NULL DEFAULT 1,
+    nights                      INT NOT NULL,
+    price_per_night             DECIMAL(10,2) NOT NULL,
+    cleaning_fee                DECIMAL(10,2) NOT NULL DEFAULT 0,
+    service_fee                 DECIMAL(10,2) NOT NULL DEFAULT 0,
+    subtotal                    DECIMAL(10,2) NOT NULL,
+    total                       DECIMAL(10,2) NOT NULL,
+    currency                    VARCHAR(8) NOT NULL DEFAULT 'usd',
+    status                      ENUM('pending','paid','failed','cancelled','refunded') NOT NULL DEFAULT 'pending',
+    stripe_payment_intent_id    VARCHAR(255) NULL,
+    stripe_checkout_session_id  VARCHAR(255) NULL,
+    stripe_connected_account_id VARCHAR(255) NULL,
+    created_at                  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at                  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    CONSTRAINT fk_bookings_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT fk_bookings_listing FOREIGN KEY (listing_id) REFERENCES listings(id) ON DELETE CASCADE,
+    INDEX idx_bookings_user (user_id),
+    INDEX idx_bookings_listing (listing_id),
+    INDEX idx_bookings_status (status),
+    INDEX idx_bookings_dates (listing_id, check_in, check_out)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE reviews (
+    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id     BIGINT NOT NULL,
+    listing_id  BIGINT NOT NULL,
+    booking_id  BIGINT NULL,
+    rating      TINYINT NOT NULL,
+    comment     TEXT NULL,
+    created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_reviews_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT fk_reviews_listing FOREIGN KEY (listing_id) REFERENCES listings(id) ON DELETE CASCADE,
+    CONSTRAINT fk_reviews_booking FOREIGN KEY (booking_id) REFERENCES bookings(id) ON DELETE SET NULL,
+    UNIQUE KEY uniq_review_per_booking (booking_id),
+    INDEX idx_reviews_listing (listing_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ---- Seed amenities ----
+INSERT INTO amenities (name, icon) VALUES
+    ('Wifi', 'wifi'),
+    ('Pool', 'waves'),
+    ('Parking', 'car'),
+    ('Air conditioning', 'snowflake'),
+    ('Kitchen', 'utensils'),
+    ('Washing machine', 'shirt'),
+    ('Television', 'tv'),
+    ('Workspace', 'briefcase'),
+    ('Heating', 'flame'),
+    ('Hot tub', 'bath'),
+    ('Gym', 'dumbbell'),
+    ('Breakfast', 'coffee'),
+    ('Fireplace', 'flame'),
+    ('Sea view', 'sailboat'),
+    ('Garden', 'trees');
+
+-- ---- Seed host user (password: host1234) ----
+-- password hash generated by bcrypt in app runtime; placeholder inserted by backend init.
+
+-- ---- Seed sample listings (images via Pexels CDN) ----
+
+-- Host: Emma Laurent
+INSERT INTO users (first_name, last_name, email, password_hash, phone, role, avatar_url) VALUES
+    ('Emma','Laurent','emma@stayhaven.com','$2b$12$placeholder_replaced_at_runtime','+33123456789','host',NULL),
+    ('James','Carter','james@stayhaven.com','$2b$12$placeholder_replaced_at_runtime','+12125551234','host',NULL),
+    ('Sofia','Russo','sofia@stayhaven.com','$2b$12$placeholder_replaced_at_runtime','+39332123456','host',NULL),
+    ('Yuki','Tanaka','yuki@stayhaven.com','$2b$12$placeholder_replaced_at_runtime','+81901234567','host',NULL),
+    ('Liam','O''Brien','liam@stayhaven.com','$2b$12$placeholder_replaced_at_runtime','+353871234567','host',NULL),
+    ('Admin','StayHaven','admin@stayhaven.com','$2b$12$placeholder_replaced_at_runtime',NULL,'admin',NULL);
+
+-- Listings for Emma (Paris apartment)
+INSERT INTO listings (owner_id, title, description, country, city, address, latitude, longitude, price_per_night, cleaning_fee, service_fee, max_guests, bedrooms, beds, bathrooms, property_type, status) VALUES
+    (1, 'Chic Parisian Loft Near Montmartre', 'Stylish loft in the heart of Montmartre with panoramic city views. Recently renovated with a modern kitchen and elegant living space.', 'France', 'Paris', '12 Rue des Abbesses, 75018 Paris', 48.8842, 2.3394, 145.00, 35.00, 20.00, 4, 2, 2, 1, 'loft', 'published'),
+    (1, 'Bright Studio Steps from the Seine', 'A bright, modern studio apartment just minutes from the Seine. Perfect for couples exploring the city.', 'France', 'Paris', '8 Rue de Buci, 75006 Paris', 48.8542, 2.3350, 98.00, 25.00, 15.00, 2, 1, 1, 1, 'studio', 'published');
+
+-- Listings for James (New York)
+INSERT INTO listings (owner_id, title, description, country, city, address, latitude, longitude, price_per_night, cleaning_fee, service_fee, max_guests, bedrooms, beds, bathrooms, property_type, status) VALUES
+    (2, 'Brooklyn Heights Luxury Apartment', 'Spacious apartment with stunning Manhattan skyline views. Located in the historic Brooklyn Heights neighborhood.', 'United States', 'New York', '75 Hicks St, Brooklyn, NY 11201', 40.6962, -73.9962, 210.00, 45.00, 25.00, 6, 3, 3, 2, 'apartment', 'published'),
+    (2, 'SoHo Designer Loft', 'A beautifully designed loft in SoHo with exposed brick walls and high ceilings. Walk to the best galleries and restaurants.', 'United States', 'New York', '92 Greene St, New York, NY 10012', 40.7222, -74.0036, 285.00, 50.00, 30.00, 4, 2, 2, 1, 'loft', 'published');
+
+-- Listings for Sofia (Italy)
+INSERT INTO listings (owner_id, title, description, country, city, address, latitude, longitude, price_per_night, cleaning_fee, service_fee, max_guests, bedrooms, beds, bathrooms, property_type, status) VALUES
+    (3, 'Tuscan Villa with Infinity Pool', 'A stunning villa in the Tuscan hills with an infinity pool overlooking vineyards. The perfect Italian retreat.', 'Italy', 'Florence', 'Via di Castello 15, 50041 Calenzano', 43.8400, 11.1700, 320.00, 60.00, 35.00, 8, 4, 5, 3, 'villa', 'published'),
+    (3, 'Cozy Cabin in the Dolomites', 'A warm and inviting cabin in the Dolomites. Perfect for a ski trip or a summer hiking adventure.', 'Italy', 'Cortina', 'Località Pocol 5, 32043 Cortina d''Ampezzo', 46.5167, 12.1167, 130.00, 30.00, 18.00, 6, 3, 4, 2, 'cabin', 'published');
+
+-- Listings for Yuki (Japan)
+INSERT INTO listings (owner_id, title, description, country, city, address, latitude, longitude, price_per_night, cleaning_fee, service_fee, max_guests, bedrooms, beds, bathrooms, property_type, status) VALUES
+    (4, 'Modern Tokyo Apartment in Shibuya', 'Sleek, modern apartment in the heart of Shibuya. Walking distance to shops, restaurants, and the famous crossing.', 'Japan', 'Tokyo', '2-10-12 Shibuya, Shibuya-ku 150-0002', 35.6612, 139.6995, 175.00, 30.00, 20.00, 4, 2, 2, 1, 'apartment', 'published'),
+    (4, 'Traditional Kyoto Townhouse', 'A beautifully restored traditional Kyoto machiya. Experience the charm of old Japan with modern comforts.', 'Japan', 'Kyoto', '432 Furumatsucho, Nakagyo-ku 604-8005', 35.0036, 135.7672, 155.00, 25.00, 18.00, 6, 3, 4, 2, 'house', 'published');
+
+-- Listings for Liam (Ireland)
+INSERT INTO listings (owner_id, title, description, country, city, address, latitude, longitude, price_per_night, cleaning_fee, service_fee, max_guests, bedrooms, beds, bathrooms, property_type, status) VALUES
+    (5, 'Cliffside Cottage in Galway', 'A charming cottage on the cliffs of Galway with breathtaking ocean views. The perfect romantic getaway.', 'Ireland', 'Galway', '15 Salthill Road, Galway H91', 53.2697, -9.0644, 120.00, 25.00, 15.00, 4, 2, 2, 1, 'cottage', 'published'),
+    (5, 'Dublin Georgian Townhouse', 'An elegant Georgian townhouse in Dublin''s city center. Beautifully decorated with period features and modern amenities.', 'Ireland', 'Dublin', '42 Fitzwilliam Square South, Dublin 2', 53.3350, -6.2580, 190.00, 40.00, 22.00, 8, 4, 5, 3, 'house', 'published');
+
+-- Listing images
+INSERT INTO listing_images (listing_id, image_url, position) VALUES
+    -- Paris loft
+    (1, 'https://images.pexels.com/photos/8135492/pexels-photo-8135492.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 0),
+    (1, 'https://images.pexels.com/photos/6434592/pexels-photo-6434592.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 1),
+    (1, 'https://images.pexels.com/photos/7195739/pexels-photo-7195739.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 2),
+    (1, 'https://images.pexels.com/photos/6957081/pexels-photo-6957081.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 3),
+    (1, 'https://images.pexels.com/photos/13722886/pexels-photo-13722886.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 4),
+    -- Paris studio
+    (2, 'https://images.pexels.com/photos/6585598/pexels-photo-6585598.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 0),
+    (2, 'https://images.pexels.com/photos/6782473/pexels-photo-6782473.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 1),
+    (2, 'https://images.pexels.com/photos/4740488/pexels-photo-4740488.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 2),
+    (2, 'https://images.pexels.com/photos/6076850/pexels-photo-6076850.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 3),
+    -- Brooklyn
+    (3, 'https://images.pexels.com/photos/7167073/pexels-photo-7167073.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 0),
+    (3, 'https://images.pexels.com/photos/8089172/pexels-photo-8089172.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 1),
+    (3, 'https://images.pexels.com/photos/7745929/pexels-photo-7745929.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 2),
+    (3, 'https://images.pexels.com/photos/17000989/pexels-photo-17000989.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 3),
+    (3, 'https://images.pexels.com/photos/7166942/pexels-photo-7166942.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 4),
+    -- SoHo loft
+    (4, 'https://images.pexels.com/photos/13722886/pexels-photo-13722886.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 0),
+    (4, 'https://images.pexels.com/photos/7546323/pexels-photo-7546323.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 1),
+    (4, 'https://images.pexels.com/photos/8089081/pexels-photo-8089081.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 2),
+    (4, 'https://images.pexels.com/photos/6538943/pexels-photo-6538943.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 3),
+    -- Tuscan villa
+    (5, 'https://images.pexels.com/photos/2476632/pexels-photo-2476632.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 0),
+    (5, 'https://images.pexels.com/photos/1488327/pexels-photo-1488327.png?auto=compress&cs=tinysrgb&h=650&w=940', 1),
+    (5, 'https://images.pexels.com/photos/14025040/pexels-photo-14025040.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 2),
+    (5, 'https://images.pexels.com/photos/261101/pexels-photo-261101.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 3),
+    (5, 'https://images.pexels.com/photos/14024788/pexels-photo-14024788.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 4),
+    -- Dolomites cabin
+    (6, 'https://images.pexels.com/photos/10988050/pexels-photo-10988050.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 0),
+    (6, 'https://images.pexels.com/photos/7746560/pexels-photo-7746560.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 1),
+    (6, 'https://images.pexels.com/photos/14295344/pexels-photo-14295344.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 2),
+    (6, 'https://images.pexels.com/photos/13221462/pexels-photo-13221462.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 3),
+    -- Tokyo
+    (7, 'https://images.pexels.com/photos/7173666/pexels-photo-7173666.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 0),
+    (7, 'https://images.pexels.com/photos/6920439/pexels-photo-6920439.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 1),
+    (7, 'https://images.pexels.com/photos/6434612/pexels-photo-6434612.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 2),
+    (7, 'https://images.pexels.com/photos/8082195/pexels-photo-8082195.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 3),
+    -- Kyoto
+    (8, 'https://images.pexels.com/photos/7174113/pexels-photo-7174113.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 0),
+    (8, 'https://images.pexels.com/photos/8251591/pexels-photo-8251591.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 1),
+    (8, 'https://images.pexels.com/photos/19836844/pexels-photo-19836844.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 2),
+    (8, 'https://images.pexels.com/photos/6903210/pexels-photo-6903210.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 3),
+    -- Galway cottage
+    (9, 'https://images.pexels.com/photos/20397881/pexels-photo-20397881.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 0),
+    (9, 'https://images.pexels.com/photos/28873269/pexels-photo-28873269.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 1),
+    (9, 'https://images.pexels.com/photos/10882330/pexels-photo-10882330.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 2),
+    (9, 'https://images.pexels.com/photos/16681604/pexels-photo-16681604.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 3),
+    -- Dublin
+    (10, 'https://images.pexels.com/photos/7195739/pexels-photo-7195739.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 0),
+    (10, 'https://images.pexels.com/photos/6265836/pexels-photo-6265836.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 1),
+    (10, 'https://images.pexels.com/photos/7031840/pexels-photo-7031840.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 2),
+    (10, 'https://images.pexels.com/photos/7511693/pexels-photo-7511693.jpeg?auto=compress&cs=tinysrgb&h=650&w=940', 3);
+
+-- Listing amenities
+INSERT INTO listing_amenities (listing_id, amenity_id) VALUES
+    (1,1),(1,4),(1,5),(1,6),(1,7),(1,8),(1,9),
+    (2,1),(2,4),(2,5),(2,7),(2,9),
+    (3,1),(3,3),(3,4),(3,5),(3,6),(3,7),(3,8),(3,9),
+    (4,1),(4,4),(4,5),(4,7),(4,8),(4,9),(4,13),
+    (5,1),(5,2),(5,3),(5,4),(5,5),(5,6),(5,7),(5,8),(5,9),(5,10),(5,14),(5,15),
+    (6,1),(6,4),(6,5),(6,6),(6,7),(6,9),(6,13),
+    (7,1),(7,3),(7,4),(7,5),(7,6),(7,7),(7,8),(7,9),
+    (8,1),(8,4),(8,5),(8,6),(8,7),(8,9),(8,15),
+    (9,1),(9,4),(9,5),(9,6),(6,9),(6,13),(9,14),
+    (10,1),(10,3),(10,4),(10,5),(10,6),(10,7),(10,8),(10,9),(10,13);
