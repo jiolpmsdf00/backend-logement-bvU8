@@ -43,7 +43,7 @@ logger = logging.getLogger("stayhaven")
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 CORS_ORIGINS = [
-    o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+    o.strip() for o in os.getenv("CORS_ORIGINS", "https://frontendlogement.vercel.app").split(",")
     if o.strip()
 ]
 
