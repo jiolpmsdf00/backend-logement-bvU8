@@ -241,7 +241,7 @@ LISTING_AMENITIES = {
 # 6. INSERT EVERYTHING
 # --------------------------------------------------
 
-def seed_database():
+def _seed_database_once():
 
     with engine.begin() as conn:
 
@@ -430,6 +430,38 @@ def seed_database():
         print("Listings:", len(LISTINGS))
         print("Amenities:", len(AMENITIES))
         print("Images:", sum(len(x) for x in IMAGE_IDS))
+
+
+def seed_database(max_attempts=5):
+    """Exécute le seed avec un verrou MySQL global (un seul seed à la fois,
+    même si deux déploiements se chevauchent) et réessaie en cas de
+    lock wait timeout (1205) ou de deadlock (1213)."""
+    import time
+    from sqlalchemy.exc import OperationalError
+
+    for attempt in range(1, max_attempts + 1):
+        lock_conn = engine.connect()
+        try:
+            got = lock_conn.execute(
+                text("SELECT GET_LOCK('stayhaven_seed', 120)")
+            ).scalar()
+            if not got:
+                raise RuntimeError("Impossible d'obtenir le verrou de seed (120s)")
+            _seed_database_once()
+            return
+        except OperationalError as e:
+            code = e.orig.args[0] if getattr(e, "orig", None) and e.orig.args else None
+            if code in (1205, 1213) and attempt < max_attempts:
+                print(f"Seed: erreur MySQL {code}, nouvelle tentative {attempt}/{max_attempts}...")
+                time.sleep(5 * attempt)
+                continue
+            raise
+        finally:
+            try:
+                lock_conn.execute(text("SELECT RELEASE_LOCK('stayhaven_seed')"))
+            except Exception:
+                pass
+            lock_conn.close()
 
 
 if __name__ == "__main__":
