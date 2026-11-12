@@ -52,7 +52,7 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 # Optionnel : secret du 2e endpoint webhook ("événements des comptes connectés")
 STRIPE_CONNECT_WEBHOOK_SECRET = os.getenv("STRIPE_CONNECT_WEBHOOK_SECRET", "")
 CORS_ORIGINS = [
-    o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
+    o.strip() for o in os.getenv("CORS_ORIGINS", "https://book44me.vercel.app").split(",")
     if o.strip()
 ]
 
