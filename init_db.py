@@ -27,6 +27,9 @@ def sync_database_schema(conn):
         "messages": {
             "content": "TEXT NULL",
         },
+        "users": {
+            "language": "VARCHAR(10) NULL DEFAULT 'fr'",
+        },
     }
 
     database_name = conn.execute(
