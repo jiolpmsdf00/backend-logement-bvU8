@@ -1,3 +1,4 @@
+
 import os
 from sqlalchemy import text
 from passlib.context import CryptContext
@@ -5,6 +6,76 @@ from db import engine
 
 pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
 DEMO_PASSWORD = os.getenv("SEED_DEMO_PASSWORD", "host1234")
+
+
+# --------------------------------------------------
+# 0. DATABASE SCHEMA SYNC
+# --------------------------------------------------
+
+def sync_database_schema(conn):
+
+    migrations = {
+        "notifications": {
+            "title": "VARCHAR(255) NULL",
+            "body": "TEXT NULL",
+            "read_at": "DATETIME NULL",
+            "dedup_key": "VARCHAR(255) NULL",
+        },
+        "conversations": {
+            "updated_at": "DATETIME NULL DEFAULT CURRENT_TIMESTAMP",
+        },
+        "messages": {
+            "content": "TEXT NULL",
+        },
+    }
+
+    database_name = conn.execute(
+        text("SELECT DATABASE()")
+    ).scalar()
+
+    for table_name, columns in migrations.items():
+
+        table_exists = conn.execute(text("""
+            SELECT COUNT(*)
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_SCHEMA = :database_name
+            AND TABLE_NAME = :table_name
+        """), {
+            "database_name": database_name,
+            "table_name": table_name
+        }).scalar()
+
+        if not table_exists:
+            print(f"Table {table_name} inexistante, migration ignorée.")
+            continue
+
+        for column_name, column_definition in columns.items():
+
+            column_exists = conn.execute(text("""
+                SELECT COUNT(*)
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = :database_name
+                AND TABLE_NAME = :table_name
+                AND COLUMN_NAME = :column_name
+            """), {
+                "database_name": database_name,
+                "table_name": table_name,
+                "column_name": column_name
+            }).scalar()
+
+            if not column_exists:
+                conn.execute(text(
+                    f"ALTER TABLE `{table_name}` "
+                    f"ADD COLUMN `{column_name}` {column_definition}"
+                ))
+
+                print(f"Colonne ajoutée : {table_name}.{column_name}")
+
+            else:
+                print(f"Colonne déjà existante : {table_name}.{column_name}")
+
+    print("Database schema synchronization completed!")
+
 
 # --------------------------------------------------
 # 1. AMENITIES
@@ -170,6 +241,9 @@ LISTING_AMENITIES = {
 def seed_database():
 
     with engine.begin() as conn:
+
+        # DATABASE SCHEMA SYNC
+        sync_database_schema(conn)
 
         # AMENITIES
         for name, icon in AMENITIES:
