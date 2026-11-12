@@ -820,6 +820,28 @@ def list_bookings(user: User = Depends(get_current_user), db: Session = Depends(
         result.append(serialize_booking(b, listing))
     return {"bookings": result}
 
+def _reconcile_pending_booking(db: Session, booking_id: int) -> None:
+    """Filet de sécurité si le webhook n'arrive pas : on interroge Stripe directement.
+    La réservation n'est marquée payée que si Stripe confirme payment_status == 'paid'."""
+    try:
+        booking = db.query(Booking).filter(Booking.id == booking_id).with_for_update().first()
+        if not booking or booking.status != "pending" or not booking.stripe_checkout_session_id:
+            db.rollback()
+            return
+        session = stripe.checkout.Session.retrieve(booking.stripe_checkout_session_id)
+        if session.get("payment_status") != "paid":
+            db.rollback()
+            return
+        logger.info(f"Reconcile: Stripe confirms session {session['id']} paid for booking "
+                    f"{booking.id} (webhook not received yet)")
+        _record_payment(db, booking, session.get("payment_intent"))
+        db.commit()
+        _flush_post_commit(db)
+    except Exception as e:
+        db.rollback()
+        db.info.pop("post_commit", None)
+        logger.warning(f"Reconcile failed for booking {booking_id}: {e}")
+
 @app.get("/api/bookings/{booking_id}")
 def get_booking(
     booking_id: int,
@@ -831,6 +853,9 @@ def get_booking(
         raise HTTPException(404, "Booking not found")
     if booking.user_id != user.id and user.role != "admin":
         raise HTTPException(403, "You don't have access to this booking")
+    if booking.status == "pending" and booking.stripe_checkout_session_id:
+        _reconcile_pending_booking(db, booking.id)
+        db.refresh(booking)
     listing = db.query(Listing).options(joinedload(Listing.images)).filter(
         Listing.id == booking.listing_id
     ).first()
@@ -1198,10 +1223,17 @@ def _handle_stripe_event(db: Session, event) -> None:
 
     if event_type in ("checkout.session.completed", "checkout.session.async_payment_succeeded"):
         if obj.get("payment_status") != "paid":
+            logger.info(f"{event_type} {obj.get('id')}: payment_status="
+                        f"{obj.get('payment_status')} — not marked paid")
             return
         booking = _booking_from_object(db, obj)
-        if booking:
-            _record_payment(db, booking, obj.get("payment_intent"))
+        if not booking:
+            logger.error(f"{event_type} {obj.get('id')}: no booking found "
+                         f"(client_reference_id={obj.get('client_reference_id')}, "
+                         f"metadata={dict(obj.get('metadata') or {})})")
+            return
+        logger.info(f"{event_type}: booking {booking.id} status={booking.status} → _record_payment")
+        _record_payment(db, booking, obj.get("payment_intent"))
 
     elif event_type == "checkout.session.expired":
         booking = _booking_from_object(db, obj)
@@ -1224,6 +1256,8 @@ def _handle_stripe_event(db: Session, event) -> None:
         booking = db.query(Booking).filter(
             Booking.stripe_payment_intent_id == pi_id
         ).with_for_update().first() if pi_id else None
+        if not booking:
+            logger.warning(f"charge.refunded: no booking for payment_intent {pi_id}")
         if booking:
             refunds = stripe.Refund.list(payment_intent=pi_id, limit=100)
             booking_total = Decimal(str(booking.total)) or Decimal("1")
@@ -1251,30 +1285,43 @@ def _handle_stripe_event(db: Session, event) -> None:
 
 @app.post("/api/webhooks/stripe")
 async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
-    payload = await request.body()
+    payload = await request.body()  # corps brut : indispensable pour la signature
     sig_header = request.headers.get("stripe-signature", "")
+    logger.info(f"Stripe webhook received: {len(payload)} bytes, "
+                f"signature header {'present' if sig_header else 'MISSING'}")
 
-    secrets = [s for s in (STRIPE_WEBHOOK_SECRET, STRIPE_CONNECT_WEBHOOK_SECRET) if s]
+    secrets = [(n, s) for n, s in (("STRIPE_WEBHOOK_SECRET", STRIPE_WEBHOOK_SECRET),
+                                   ("STRIPE_CONNECT_WEBHOOK_SECRET", STRIPE_CONNECT_WEBHOOK_SECRET)) if s]
     if not secrets:
-        logger.error("STRIPE_WEBHOOK_SECRET not configured — webhook rejected")
+        logger.error("Stripe webhook rejected: no webhook secret configured "
+                     "(STRIPE_WEBHOOK_SECRET / STRIPE_CONNECT_WEBHOOK_SECRET empty)")
         raise HTTPException(500, "Webhook secret not configured")
 
     event = None
-    for secret in secrets:
+    used = None
+    for name, secret in secrets:
         try:
             event = stripe.Webhook.construct_event(payload, sig_header, secret)
+            used = name
             break
         except ValueError:
+            logger.error("Stripe webhook rejected: payload is not valid JSON")
             raise HTTPException(400, "Invalid payload")
-        except stripe.error.SignatureVerificationError:
+        except stripe.error.SignatureVerificationError as e:
+            logger.warning(f"Stripe webhook: signature does not match {name} ({e})")
             continue
     if event is None:
+        logger.error("Stripe webhook rejected: signature matches none of the configured secrets "
+                     f"({', '.join(n for n, _ in secrets)}). Check the whsec_ of the endpoint "
+                     "(test vs live mode, correct endpoint).")
         raise HTTPException(400, "Invalid signature")
 
-    logger.info(f"Stripe webhook: {event['type']}")
+    logger.info(f"Stripe webhook verified with {used}: id={event['id']} type={event['type']} "
+                f"livemode={event.get('livemode')} account={event.get('account') or 'platform'}")
 
     # Anti-doublons : un événement n'est traité qu'une seule fois
     if db.query(StripeEvent).filter(StripeEvent.id == event["id"]).first():
+        logger.info(f"Stripe event {event['id']} already processed — skipped")
         return {"received": True, "duplicate": True}
 
     try:
@@ -1284,13 +1331,15 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     except IntegrityError:
         db.rollback()
         db.info.pop("post_commit", None)
+        logger.info(f"Stripe event {event['id']} processed concurrently — skipped")
         return {"received": True, "duplicate": True}
     except Exception as e:
         db.rollback()
         db.info.pop("post_commit", None)
-        logger.exception(f"Webhook processing failed ({event['type']}): {e}")
+        logger.exception(f"Webhook processing failed ({event['type']} {event['id']}): {e}")
         raise HTTPException(500, "Webhook processing failed")  # Stripe réessaiera
 
+    logger.info(f"Stripe event {event['id']} ({event['type']}) processed and committed")
     # Temps réel (message de réservation + notifications) : uniquement après le commit
     _flush_post_commit(db)
 
