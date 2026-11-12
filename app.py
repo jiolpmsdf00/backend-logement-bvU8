@@ -257,7 +257,7 @@ def stripe_connect_onboard(
                     "transfers": {"requested": True},
                 },
                 metadata={"user_id": str(user.id)},
-                idempotency_key=f"connect-account-user-{user.id}",
+                idempotency_key=f"connect-account-user-{user.id}-v2",
             )
             user.stripe_account_id = account.id
             db.commit()
