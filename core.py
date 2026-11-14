@@ -2,10 +2,18 @@
 from __future__ import annotations
 
 import os
+import io
+import time
+import base64
+import hashlib
+import hmac
+import secrets
+import struct
 import logging
+from urllib.parse import quote
 from datetime import datetime, timedelta, date
 from typing import Optional
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 
 import stripe
 from passlib.context import CryptContext
@@ -13,10 +21,10 @@ from jose import jwt, JWTError
 from fastapi import HTTPException, status, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, or_, select, func
 
 from db import User, Listing, Booking, Favorite, PaymentTransaction, SessionLocal, get_db
-from db import Conversation, Message, Notification, Review
+from db import Conversation, Message, Notification, Review, BlockedDate, CancellationRequest
 
 logger = logging.getLogger("stayhaven")
 
@@ -28,17 +36,26 @@ pwd_context = CryptContext(
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "168"))
-FRONTEND_URL = os.getenv("FRONTEND_URL", "https://book4me.up.railway.app")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
 # Commission de la plateforme (en %) prélevée sur chaque réservation
 PLATFORM_FEE_PERCENT = Decimal(os.getenv("PLATFORM_FEE_PERCENT", "10"))
 
 SUPPORTED_LANGUAGES = ("en", "fr", "es", "de", "it", "pt")
 
+# Nom affiché dans l'application d'authentification (Google Authenticator, Authy...)
+TOTP_ISSUER = os.getenv("TOTP_ISSUER", "Book4Me")
+
 STRIPE_REQUIRED_MESSAGE = (
     "Stripe Connect setup is required to publish a listing. "
     "Please complete it from your host dashboard."
 )
+
+# Politique d'annulation commune à tous les logements
+CANCEL_FULL_REFUND_HOURS = 7 * 24   # > 7 jours avant l'arrivée : 100 %
+CANCEL_PARTIAL_REFUND_HOURS = 24    # entre 24 h et 7 jours : 50 %, en dessous : 0 %
+DEFAULT_CHECK_IN_TIME = "15:00"
+DEFAULT_CHECK_OUT_TIME = "11:00"
 
 security_scheme = HTTPBearer(auto_error=False)
 
@@ -64,6 +81,64 @@ def decode_token(token: str) -> Optional[dict]:
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except JWTError:
+        return None
+
+# ─── TOTP (Google Authenticator / Authy, RFC 6238) ─────────────
+
+def generate_totp_secret() -> str:
+    """Secret aléatoire de 160 bits, encodé en base32 (32 caractères, sans padding)."""
+    return base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+
+def _totp_at(secret: str, counter: int, digits: int = 6) -> str:
+    key = base64.b32decode(secret + "=" * (-len(secret) % 8), casefold=True)
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    code = (struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+    return str(code).zfill(digits)
+
+def verify_totp(secret: str, code: str, last_step: int = 0, window: int = 1) -> Optional[int]:
+    """Vérifie un code à 6 chiffres (tolérance ±window pas de 30 s).
+
+    Retourne le pas de temps accepté, ou None. Un pas déjà utilisé
+    (<= last_step) est refusé : un même code ne sert qu'une fois.
+    """
+    code = (code or "").strip().replace(" ", "")
+    if not (code.isdigit() and len(code) == 6) or not secret:
+        return None
+    current = int(time.time() // 30)
+    try:
+        for step in range(current - window, current + window + 1):
+            if step <= int(last_step or 0):
+                continue
+            if hmac.compare_digest(_totp_at(secret, step), code):
+                return step
+    except Exception:
+        return None
+    return None
+
+def totp_provisioning_uri(secret: str, email: str) -> str:
+    issuer = quote(TOTP_ISSUER)
+    return (
+        f"otpauth://totp/{issuer}:{quote(email)}"
+        f"?secret={secret}&issuer={issuer}&algorithm=SHA1&digits=6&period=30"
+    )
+
+def make_qr_data_url(data: str) -> Optional[str]:
+    """QR code (SVG, data URL). Retourne None si la librairie 'qrcode' est absente."""
+    try:
+        import qrcode
+        import qrcode.image.svg
+    except ImportError:
+        logger.warning("Package 'qrcode' not installed: QR code unavailable (manual key only)")
+        return None
+    try:
+        img = qrcode.make(data, image_factory=qrcode.image.svg.SvgPathImage,
+                          box_size=10, border=2)
+        buf = io.BytesIO()
+        img.save(buf)
+        return "data:image/svg+xml;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception as e:
+        logger.warning(f"QR code generation failed: {e}")
         return None
 
 # ─── Auth Dependencies ─────────────────────────────────────────
@@ -174,7 +249,8 @@ def ensure_can_publish(owner: Optional[User], db: Session) -> None:
 def check_date_overlap(db: Session, listing_id: int,
                        check_in: date, check_out: date,
                        exclude_booking_id: Optional[int] = None) -> bool:
-    """Return True if any confirmed/pending booking overlaps the given dates."""
+    """Return True if any confirmed/pending booking overlaps the given dates,
+    or if the host blocked at least one of the requested nights."""
     q = db.query(Booking).filter(
         Booking.listing_id == listing_id,
         Booking.status.in_(["pending", "paid"]),
@@ -183,7 +259,14 @@ def check_date_overlap(db: Session, listing_id: int,
     )
     if exclude_booking_id:
         q = q.filter(Booking.id != exclude_booking_id)
-    return q.first() is not None
+    if q.first() is not None:
+        return True
+    blocked = db.query(BlockedDate.id).filter(
+        BlockedDate.listing_id == listing_id,
+        BlockedDate.blocked_on >= check_in,
+        BlockedDate.blocked_on < check_out,
+    ).first()
+    return blocked is not None
 
 def calculate_booking_price(listing: Listing, check_in: date,
                             check_out: date, guests: int = 1) -> dict:
@@ -217,7 +300,64 @@ def validate_booking_dates(check_in: date, check_out: date) -> None:
     if (check_out - check_in).days > 365:
         raise HTTPException(400, "Booking cannot exceed 365 nights")
 
+# ─── Cancellation policy helpers ───────────────────────────────
+
+def normalize_hhmm(value: Optional[str], default: str) -> str:
+    """Retourne 'HH:MM' valide, sinon la valeur par défaut."""
+    try:
+        h, m = (value or default).strip().split(":")[:2]
+        h, m = int(h), int(m)
+        if 0 <= h < 24 and 0 <= m < 60:
+            return f"{h:02d}:{m:02d}"
+    except Exception:
+        pass
+    return default
+
+def arrival_datetime(check_in: date, check_in_time: Optional[str]) -> datetime:
+    """Date + heure d'arrivée du logement (heure locale du serveur, comme date.today())."""
+    hhmm = normalize_hhmm(check_in_time, DEFAULT_CHECK_IN_TIME)
+    h, m = hhmm.split(":")
+    return datetime(check_in.year, check_in.month, check_in.day, int(h), int(m))
+
+def cancellation_policy(arrival: datetime, now: datetime) -> tuple[int, float]:
+    """Retourne (pourcentage remboursable, heures restantes avant l'arrivée).
+
+    > 7 jours : 100 % · de 24 h à 7 jours (inclus) : 50 % · < 24 h : 0 %.
+    """
+    hours = (arrival - now).total_seconds() / 3600
+    if hours > CANCEL_FULL_REFUND_HOURS:
+        return 100, hours
+    if hours >= CANCEL_PARTIAL_REFUND_HOURS:
+        return 50, hours
+    return 0, hours
+
+def policy_refund_cents(total_cents: int, percent: int) -> int:
+    """Montant dû au client selon la politique (arrondi inférieur au centime)."""
+    return int((Decimal(total_cents) * Decimal(percent) / 100).quantize(
+        Decimal("1"), rounding=ROUND_DOWN))
+
+def refundable_cents(total_cents: int, percent: int, already_refunded_cents: int) -> int:
+    """Reste à rembourser : montant dû selon la politique moins ce qui a déjà été remboursé,
+    sans jamais dépasser ce qui reste remboursable sur le paiement."""
+    entitled = policy_refund_cents(total_cents, percent)
+    remaining = max(0, total_cents - already_refunded_cents)
+    return max(0, min(entitled - already_refunded_cents, remaining))
+
+def ledger_refunded_cents(db: Session, booking_id: int) -> int:
+    """Somme des remboursements déjà enregistrés dans le ledger pour cette réservation."""
+    total = db.query(func.coalesce(func.sum(PaymentTransaction.amount), 0)).filter(
+        PaymentTransaction.booking_id == booking_id,
+        PaymentTransaction.type == "refund",
+    ).scalar() or 0
+    return int((Decimal(str(total)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
 # ─── Serialization ─────────────────────────────────────────────
+
+def _iso(v):
+    return v.isoformat() if v else None
+
+def _flt(v):
+    return float(v) if v is not None else None
 
 def serialize_user(user: User) -> dict:
     return {
@@ -230,7 +370,14 @@ def serialize_user(user: User) -> dict:
         "avatar_url": user.avatar_url,
         "language": getattr(user, "language", None) or "en",
         "stripe_ready": host_stripe_ready(user),
-        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "totp_enabled": bool(getattr(user, "totp_enabled", False)),
+        "created_at": (
+    user.created_at.isoformat()
+    if hasattr(user.created_at, "isoformat")
+    else user.created_at
+    if user.created_at
+    else None
+),
     }
 
 
@@ -254,6 +401,17 @@ def serialize_listing(listing: Listing, include_owner: bool = False) -> dict:
         "bathrooms": listing.bathrooms,
         "property_type": listing.property_type,
         "status": listing.status,
+
+        # Règles du logement
+        "check_in_time": normalize_hhmm(listing.check_in_time, DEFAULT_CHECK_IN_TIME),
+        "check_out_time": normalize_hhmm(listing.check_out_time, DEFAULT_CHECK_OUT_TIME),
+        "pets_allowed": bool(listing.pets_allowed),
+        "smoking_allowed": bool(listing.smoking_allowed),
+        "parties_allowed": bool(listing.parties_allowed),
+        "events_allowed": bool(listing.events_allowed),
+        "children_allowed": True if listing.children_allowed is None else bool(listing.children_allowed),
+        "arrival_instructions": listing.arrival_instructions,
+        "additional_rules": listing.additional_rules,
 
         "created_at": (
             listing.created_at.isoformat()
@@ -322,6 +480,27 @@ def serialize_booking(booking: Booking, listing: Optional[Listing] = None) -> di
         "stripe_checkout_session_id": booking.stripe_checkout_session_id,
         "created_at": booking.created_at.isoformat() if booking.created_at else None,
     }
+    # Avis éventuellement déjà laissé pour cette réservation (un seul par réservation)
+    booking_reviews = booking.reviews or []
+    data["has_review"] = len(booking_reviews) > 0
+    data["review"] = {
+        "id": booking_reviews[0].id,
+        "rating": booking_reviews[0].rating,
+        "comment": booking_reviews[0].comment,
+    } if booking_reviews else None
+    # Dernière demande d'annulation (résumé)
+    requests_ = booking.cancellation_requests or []
+    if requests_:
+        last = max(requests_, key=lambda r: r.id)
+        data["cancellation"] = {
+            "id": last.id,
+            "status": last.status,
+            "refund_percent": last.refund_percent,
+            "refundable_amount": float(last.refundable_amount or 0),
+            "refunded_amount": _flt(last.refunded_amount),
+        }
+    else:
+        data["cancellation"] = None
     if listing:
         data["listing"] = {
             "id": listing.id,
@@ -331,6 +510,53 @@ def serialize_booking(booking: Booking, listing: Optional[Listing] = None) -> di
             "images": [
                 {"image_url": img.image_url} for img in (listing.images or [])
             ],
+        }
+    return data
+
+def serialize_cancellation(
+    creq: CancellationRequest,
+    booking: Optional[Booking] = None,
+    listing: Optional[Listing] = None,
+    guest: Optional[User] = None,
+) -> dict:
+    data = {
+        "id": creq.id,
+        "booking_id": creq.booking_id,
+        "user_id": creq.user_id,
+        "status": creq.status,
+        "reason": creq.reason,
+        "hours_before_arrival": float(creq.hours_before_arrival or 0),
+        "refund_percent": creq.refund_percent,
+        "total_paid": float(creq.total_paid or 0),
+        "already_refunded": float(creq.already_refunded or 0),
+        "refundable_amount": float(creq.refundable_amount or 0),
+        "approved_amount": _flt(creq.approved_amount),
+        "refunded_amount": _flt(creq.refunded_amount),
+        "currency": creq.currency,
+        "admin_note": creq.admin_note,
+        "decided_at": _iso(creq.decided_at),
+        "processed_at": _iso(creq.processed_at),
+        "stripe_refund_id": creq.stripe_refund_id,
+        "failure_reason": creq.failure_reason,
+        "created_at": _iso(creq.created_at),
+    }
+    if booking:
+        data["booking"] = {
+            "id": booking.id,
+            "check_in": booking.check_in.isoformat(),
+            "check_out": booking.check_out.isoformat(),
+            "status": booking.status,
+            "total": float(booking.total),
+        }
+    if listing:
+        data["listing"] = {
+            "id": listing.id, "title": listing.title,
+            "city": listing.city, "country": listing.country,
+        }
+    if guest:
+        data["guest"] = {
+            "first_name": guest.first_name, "last_name": guest.last_name,
+            "email": guest.email,
         }
     return data
 
