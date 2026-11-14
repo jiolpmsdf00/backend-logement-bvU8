@@ -61,6 +61,12 @@ class User(Base):
     language = Column(String(5), nullable=False, default="en", server_default="en")
     # Description publique du Host (profil public)
     host_bio = Column(Text, nullable=True)
+    # Authentificateur (TOTP, type Google Authenticator / Authy) pour la
+    # réinitialisation du mot de passe
+    totp_secret = Column(String(64), nullable=True)
+    totp_enabled = Column(Boolean, nullable=False, default=False, server_default="0")
+    # Dernier pas de temps TOTP accepté (empêche de réutiliser un même code)
+    totp_last_step = Column(BigInteger, nullable=False, default=0, server_default="0")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False,
                         default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -109,6 +115,16 @@ class Listing(Base):
                            name="listing_status"),
                     nullable=False, default="draft", index=True)
     stripe_connected_account_id = Column(String(255), nullable=True)
+    # ── Règles du logement ──
+    check_in_time = Column(String(5), nullable=False, default="15:00", server_default="15:00")
+    check_out_time = Column(String(5), nullable=False, default="11:00", server_default="11:00")
+    pets_allowed = Column(Boolean, nullable=False, default=False, server_default="0")
+    smoking_allowed = Column(Boolean, nullable=False, default=False, server_default="0")
+    parties_allowed = Column(Boolean, nullable=False, default=False, server_default="0")
+    events_allowed = Column(Boolean, nullable=False, default=False, server_default="0")
+    children_allowed = Column(Boolean, nullable=False, default=True, server_default="1")
+    arrival_instructions = Column(Text, nullable=True)
+    additional_rules = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False,
                         default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -125,6 +141,8 @@ class Listing(Base):
                             cascade="all, delete-orphan")
     reviews = relationship("Review", back_populates="listing",
                            cascade="all, delete-orphan")
+    blocked_dates = relationship("BlockedDate", back_populates="listing",
+                                 cascade="all, delete-orphan")
 
 class ListingImage(Base):
     __tablename__ = "listing_images"
@@ -152,6 +170,21 @@ class ListingAmenity(Base):
                         primary_key=True)
     amenity_id = Column(BigInteger, ForeignKey("amenities.id", ondelete="CASCADE"),
                         primary_key=True)
+
+class BlockedDate(Base):
+    """Nuit rendue indisponible par le Host (calendrier de disponibilités)."""
+    __tablename__ = "blocked_dates"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    listing_id = Column(BigInteger, ForeignKey("listings.id", ondelete="CASCADE"),
+                        nullable=False, index=True)
+    blocked_on = Column(Date, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("listing_id", "blocked_on", name="uniq_listing_blocked_date"),
+    )
+
+    listing = relationship("Listing", back_populates="blocked_dates")
 
 class Favorite(Base):
     __tablename__ = "favorites"
@@ -198,6 +231,9 @@ class Booking(Base):
     listing = relationship("Listing", back_populates="bookings")
     reviews = relationship("Review", back_populates="booking",
                            cascade="all, delete-orphan")
+    cancellation_requests = relationship(
+        "CancellationRequest", back_populates="booking",
+        cascade="all, delete-orphan", order_by="CancellationRequest.id")
 
 class Review(Base):
     __tablename__ = "reviews"
@@ -215,6 +251,46 @@ class Review(Base):
     user = relationship("User")
     listing = relationship("Listing", back_populates="reviews")
     booking = relationship("Booking", back_populates="reviews")
+
+class CancellationRequest(Base):
+    """Demande d'annulation d'une réservation payée (validée par un administrateur).
+
+    Les montants sont figés à la création (politique appliquée au moment de la demande).
+    Statuts : pending → approved | rejected | processing → refunded | failed.
+    """
+    __tablename__ = "cancellation_requests"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    booking_id = Column(BigInteger, ForeignKey("bookings.id", ondelete="CASCADE"),
+                        nullable=False, index=True)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"),
+                     nullable=False, index=True)
+    status = Column(
+        SAEnum("pending", "approved", "rejected", "processing", "refunded", "failed",
+               name="cancellation_status"),
+        nullable=False, default="pending", index=True)
+    reason = Column(Text, nullable=True)
+    hours_before_arrival = Column(Numeric(10, 2), nullable=False, default=0)
+    refund_percent = Column(Integer, nullable=False, default=0)
+    total_paid = Column(Numeric(10, 2), nullable=False, default=0)
+    already_refunded = Column(Numeric(10, 2), nullable=False, default=0)
+    refundable_amount = Column(Numeric(10, 2), nullable=False, default=0)
+    # Montant demandé à Stripe à l'approbation / montant réellement remboursé (confirmé)
+    approved_amount = Column(Numeric(10, 2), nullable=True)
+    refunded_amount = Column(Numeric(10, 2), nullable=True)
+    currency = Column(String(8), nullable=False, default="usd")
+    admin_id = Column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    admin_note = Column(Text, nullable=True)
+    decided_at = Column(DateTime, nullable=True)
+    processed_at = Column(DateTime, nullable=True)
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    stripe_refund_id = Column(String(255), nullable=True, index=True)
+    failure_reason = Column(String(255), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False,
+                        default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    booking = relationship("Booking", back_populates="cancellation_requests")
+    user = relationship("User", foreign_keys=[user_id])
 
 class PaymentTransaction(Base):
     """Historique (ledger) des paiements, commissions, versements et remboursements."""
@@ -288,7 +364,7 @@ class Notification(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"),
                      nullable=False, index=True)
-    type = Column(String(40), nullable=False)  # message | booking | system
+    type = Column(String(40), nullable=False)  # message | booking | review | system
     title = Column(String(200), nullable=False)
     body = Column(Text, nullable=True)
     link = Column(String(500), nullable=True)
