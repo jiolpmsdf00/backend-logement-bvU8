@@ -1501,7 +1501,10 @@ def admin_approve_cancellation(
                     "cancellation_request_id": str(creq.id),
                     "booking_id": str(booking.id),
                 },
-                idempotency_key=f"cancel-req-{creq.id}-attempt-{creq.attempts}",
+                idempotency_key=(
+    f"{os.getenv('STRIPE_IDEMPOTENCY_NAMESPACE', 'app')}"
+    f"-refund-v2-cancel-req-{creq.id}-attempt-{creq.attempts}"
+),
             )
     except (stripe.error.APIConnectionError, stripe.error.APIError) as e:
         # Issue incertaine : la demande reste « processing » (voir /sync et le webhook)
