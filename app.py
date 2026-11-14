@@ -9,6 +9,8 @@ load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
 
 import os
 import json
+import re
+import time
 import asyncio
 import logging
 from datetime import date, datetime
@@ -27,7 +29,7 @@ from sqlalchemy.exc import IntegrityError
 from db import (
     get_db, SessionLocal, User, Listing, ListingImage, Amenity, ListingAmenity,
     Favorite, Booking, Review, PaymentTransaction, StripeEvent, Base, engine,
-    Conversation, Message, Notification,
+    Conversation, Message, Notification, BlockedDate, CancellationRequest,
 )
 from core import (
     hash_password, verify_password, create_access_token, decode_token,
@@ -35,11 +37,14 @@ from core import (
     validate_email, validate_password,
     check_date_overlap, calculate_booking_price, validate_booking_dates,
     serialize_user, serialize_listing, serialize_booking, serialize_review,
-    serialize_payment,
+    serialize_payment, serialize_cancellation,
     serialize_message, serialize_conversation, serialize_notification,
     compute_split, host_stripe_ready, apply_stripe_account, sync_stripe_account,
     ensure_can_publish,
     get_or_create_conversation, user_in_conversation, create_notification,
+    generate_totp_secret, verify_totp, totp_provisioning_uri, make_qr_data_url,
+    arrival_datetime, cancellation_policy, policy_refund_cents, refundable_cents,
+    ledger_refunded_cents, normalize_hhmm,
     FRONTEND_URL, PLATFORM_FEE_PERCENT, SUPPORTED_LANGUAGES,
 )
 
@@ -52,7 +57,7 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 # Optionnel : secret du 2e endpoint webhook ("événements des comptes connectés")
 STRIPE_CONNECT_WEBHOOK_SECRET = os.getenv("STRIPE_CONNECT_WEBHOOK_SECRET", "")
 CORS_ORIGINS = [
-    o.strip() for o in os.getenv("CORS_ORIGINS", "https://book4me.up.railway.app").split(",")
+    o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
     if o.strip()
 ]
 
@@ -86,6 +91,15 @@ class LoginRequest(BaseModel):
     email: str
     password: str
 
+HHMM_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+def _validate_hhmm(v):
+    if v is None:
+        return v
+    if not HHMM_RE.match(v):
+        raise ValueError("Invalid time (expected HH:MM)")
+    return v
+
 class ListingCreate(BaseModel):
     title: str
     description: Optional[str] = None
@@ -104,6 +118,21 @@ class ListingCreate(BaseModel):
     property_type: str = "apartment"
     amenity_ids: List[int] = []
     image_urls: List[str] = []
+    # Règles du logement
+    check_in_time: str = "15:00"
+    check_out_time: str = "11:00"
+    pets_allowed: bool = False
+    smoking_allowed: bool = False
+    parties_allowed: bool = False
+    events_allowed: bool = False
+    children_allowed: bool = True
+    arrival_instructions: Optional[str] = None
+    additional_rules: Optional[str] = None
+
+    @field_validator("check_in_time", "check_out_time")
+    @classmethod
+    def _v_times(cls, v):
+        return _validate_hhmm(v)
 
 class ListingUpdate(BaseModel):
     title: Optional[str] = None
@@ -124,6 +153,21 @@ class ListingUpdate(BaseModel):
     status: Optional[str] = None
     amenity_ids: Optional[List[int]] = None
     image_urls: Optional[List[str]] = None
+    # Règles du logement
+    check_in_time: Optional[str] = None
+    check_out_time: Optional[str] = None
+    pets_allowed: Optional[bool] = None
+    smoking_allowed: Optional[bool] = None
+    parties_allowed: Optional[bool] = None
+    events_allowed: Optional[bool] = None
+    children_allowed: Optional[bool] = None
+    arrival_instructions: Optional[str] = None
+    additional_rules: Optional[str] = None
+
+    @field_validator("check_in_time", "check_out_time")
+    @classmethod
+    def _v_times(cls, v):
+        return _validate_hhmm(v)
 
 class BookingCreate(BaseModel):
     listing_id: int
@@ -160,6 +204,34 @@ class HostProfileUpdate(BaseModel):
 
 class MarkNotificationsRead(BaseModel):
     notification_ids: Optional[List[int]] = None
+
+class ProfileUpdate(BaseModel):
+    first_name: str
+    last_name: str
+
+class PasswordChange(BaseModel):
+    current_password: str
+    new_password: str
+
+class ForgotPasswordRequest(BaseModel):
+    email: str
+    code: str
+    new_password: str
+
+class TotpCodeRequest(BaseModel):
+    code: str
+
+class TotpDisableRequest(BaseModel):
+    password: str
+
+class BlockDatesRequest(BaseModel):
+    dates: List[date]
+
+class CancellationCreate(BaseModel):
+    reason: Optional[str] = None
+
+class AdminDecision(BaseModel):
+    note: Optional[str] = None
 
 # ─── Auth Endpoints ────────────────────────────────────────────
 
@@ -236,6 +308,153 @@ def become_host(
     db.commit()
     db.refresh(user)
     return {"user": serialize_user(user)}
+
+# ─── Profil : nom et mot de passe ──────────────────────────────
+
+@app.put("/api/auth/profile")
+def update_profile(
+    req: ProfileUpdate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    first_name = (req.first_name or "").strip()
+    last_name = (req.last_name or "").strip()
+    if not first_name or not last_name:
+        raise HTTPException(422, "First and last name are required")
+    if len(first_name) > 80 or len(last_name) > 80:
+        raise HTTPException(422, "Name is too long (max 80 characters)")
+    user.first_name = first_name
+    user.last_name = last_name
+    db.commit()
+    db.refresh(user)
+    return {"user": serialize_user(user)}
+
+@app.put("/api/auth/password")
+def change_password(
+    req: PasswordChange,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not verify_password(req.current_password, user.password_hash):
+        raise HTTPException(400, "Current password is incorrect")
+    if not validate_password(req.new_password):
+        raise HTTPException(422, "Password must be at least 6 characters")
+    user.password_hash = hash_password(req.new_password)
+    db.commit()
+    logger.info(f"Password changed for user {user.id}")
+    return {"message": "Password updated"}
+
+# ─── Authentificateur (TOTP) + mot de passe oublié ─────────────
+
+# Anti force brute : 5 tentatives de réinitialisation par e-mail et par 15 minutes
+# (compteur en mémoire, par processus).
+_reset_attempts: Dict[str, List[float]] = {}
+RESET_MAX_ATTEMPTS = 5
+RESET_WINDOW_SECONDS = 900
+
+def _check_reset_rate(key: str) -> None:
+    now = time.time()
+    recent = [ts for ts in _reset_attempts.get(key, []) if now - ts < RESET_WINDOW_SECONDS]
+    if len(recent) >= RESET_MAX_ATTEMPTS:
+        _reset_attempts[key] = recent
+        raise HTTPException(429, "Too many attempts. Please try again later.")
+    recent.append(now)
+    _reset_attempts[key] = recent
+    # Nettoyage occasionnel pour ne pas faire grossir le dictionnaire
+    if len(_reset_attempts) > 5000:
+        for k in list(_reset_attempts.keys()):
+            if not any(now - ts < RESET_WINDOW_SECONDS for ts in _reset_attempts[k]):
+                _reset_attempts.pop(k, None)
+
+@app.post("/api/auth/totp/setup")
+def totp_setup(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Génère un secret TOTP et le QR code à scanner (Google Authenticator, Authy...).
+
+    L'authentificateur n'est actif qu'après confirmation d'un code (/totp/enable).
+    """
+    if user.totp_enabled:
+        raise HTTPException(400, "Authenticator is already enabled")
+    secret = generate_totp_secret()
+    user.totp_secret = secret
+    user.totp_enabled = False
+    user.totp_last_step = 0
+    db.commit()
+    uri = totp_provisioning_uri(secret, user.email)
+    return {
+        "secret": secret,
+        "otpauth_uri": uri,
+        "qr_code": make_qr_data_url(uri),
+    }
+
+@app.post("/api/auth/totp/enable")
+def totp_enable(
+    req: TotpCodeRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if user.totp_enabled:
+        raise HTTPException(400, "Authenticator is already enabled")
+    if not user.totp_secret:
+        raise HTTPException(400, "Authenticator setup has not been started")
+    step = verify_totp(user.totp_secret, req.code, 0)
+    if step is None:
+        raise HTTPException(400, "Invalid verification code")
+    user.totp_enabled = True
+    user.totp_last_step = step
+    db.commit()
+    db.refresh(user)
+    logger.info(f"Authenticator enabled for user {user.id}")
+    return {"user": serialize_user(user)}
+
+@app.post("/api/auth/totp/disable")
+def totp_disable(
+    req: TotpDisableRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if not verify_password(req.password, user.password_hash):
+        raise HTTPException(400, "Current password is incorrect")
+    user.totp_secret = None
+    user.totp_enabled = False
+    user.totp_last_step = 0
+    db.commit()
+    db.refresh(user)
+    logger.info(f"Authenticator disabled for user {user.id}")
+    return {"user": serialize_user(user)}
+
+@app.post("/api/auth/forgot-password")
+def forgot_password(
+    req: ForgotPasswordRequest,
+    db: Session = Depends(get_db),
+):
+    """Réinitialise le mot de passe avec le code de l'application d'authentification.
+
+    Message d'erreur volontairement identique (compte inconnu, authentificateur non
+    activé, code faux) pour ne pas révéler quels e-mails existent.
+    """
+    email = (req.email or "").strip().lower()
+    _check_reset_rate(f"email:{email}")
+
+    if not validate_password(req.new_password):
+        raise HTTPException(422, "Password must be at least 6 characters")
+
+    generic_error = HTTPException(400, "Invalid email or verification code")
+    user = db.query(User).filter(User.email == email).first()
+    if not user or not user.totp_enabled or not user.totp_secret:
+        raise generic_error
+    step = verify_totp(user.totp_secret, req.code, user.totp_last_step or 0)
+    if step is None:
+        raise generic_error
+
+    user.totp_last_step = step
+    user.password_hash = hash_password(req.new_password)
+    db.commit()
+    _reset_attempts.pop(f"email:{email}", None)
+    logger.info(f"Password reset via authenticator for user {user.id}")
+    return {"message": "Password reset successfully"}
 
 # ─── Stripe Connect (Host) ─────────────────────────────────────
 
@@ -402,6 +621,12 @@ def search_listings(
                 Booking.check_out > ci,
             ).distinct().all()
             excluded_ids = {r[0] for r in overlapping}
+            # Nuits bloquées par le Host
+            blocked = db.query(BlockedDate.listing_id).filter(
+                BlockedDate.blocked_on >= ci,
+                BlockedDate.blocked_on < co,
+            ).distinct().all()
+            excluded_ids |= {r[0] for r in blocked}
         except ValueError:
             pass
 
@@ -441,7 +666,9 @@ def get_listing(
         ).first()
         is_favorite = fav is not None
 
-    reviews = db.query(Review).filter(Review.listing_id == listing_id).all()
+    reviews = db.query(Review).filter(Review.listing_id == listing_id).order_by(
+        Review.created_at.desc()
+    ).all()
     avg_rating = sum(r.rating for r in reviews) / len(reviews) if reviews else None
 
     data = serialize_listing(listing, include_owner=True)
@@ -876,6 +1103,14 @@ def cancel_booking(
     if booking.status not in ("pending", "paid"):
         raise HTTPException(400, "This booking cannot be cancelled")
 
+    # Une réservation payée ne s'annule plus directement côté client :
+    # elle passe par une demande d'annulation validée par un administrateur.
+    if booking.status == "paid" and user.role != "admin":
+        raise HTTPException(
+            400,
+            "Paid bookings must be cancelled through a cancellation request.",
+        )
+
     if booking.status == "paid":
         if not booking.stripe_payment_intent_id:
             booking.status = "cancelled"
@@ -900,6 +1135,441 @@ def cancel_booking(
     db.commit()
     _expire_checkout_session(booking)
     return {"message": "Booking cancelled", "status": "cancelled"}
+
+# ─── Annulation & remboursement (demande client → validation admin → Stripe) ───
+
+ACTIVE_CANCELLATION_STATUSES = ("pending", "approved", "processing", "refunded", "failed")
+
+def _notify(db: Session, user_id: int, title: str, body: str, link: str, dedup_key: str) -> None:
+    """Crée une notification (système existant) et programme l'envoi temps réel après commit."""
+    notif = create_notification(db, user_id, "booking", title, body, link, dedup_key=dedup_key)
+    if notif is not None:
+        db.flush()
+        _queue_post_commit(db, "notification", user_id, notif)
+
+def _notify_admins(db: Session, title: str, body: str, dedup_prefix: str) -> None:
+    for admin in db.query(User).filter(User.role == "admin").all():
+        _notify(db, admin.id, title, body, "/#/admin", f"{dedup_prefix}-admin-{admin.id}")
+
+def _cancellation_context(db: Session, booking: Booking, now: datetime):
+    listing = db.query(Listing).filter(Listing.id == booking.listing_id).first()
+    arrival = arrival_datetime(booking.check_in, listing.check_in_time if listing else None)
+    percent, hours = cancellation_policy(arrival, now)
+    total_cents = compute_split(booking.total)[0]
+    already = ledger_refunded_cents(db, booking.id)
+    refundable = refundable_cents(total_cents, percent, already)
+    return listing, arrival, percent, hours, total_cents, already, refundable
+
+def _stripe_refunded_cents(pi_id: str) -> int:
+    """Montant DÉJÀ remboursé selon Stripe (source de vérité, inclut le dashboard Stripe)."""
+    pi = stripe.PaymentIntent.retrieve(pi_id, expand=["latest_charge"])
+    charge = pi.get("latest_charge")
+    return int(charge.get("amount_refunded") or 0) if charge else 0
+
+def _find_request_refund(pi_id: str, request_id: int):
+    """Retrouve chez Stripe un remboursement déjà créé pour cette demande (anti-doublon)."""
+    refunds = stripe.Refund.list(payment_intent=pi_id, limit=100)
+    for r in refunds.get("data", []):
+        meta = r.get("metadata") or {}
+        if str(meta.get("cancellation_request_id")) == str(request_id) and \
+                r.get("status") in ("succeeded", "pending", "requires_action"):
+            return r
+    return None
+
+def _complete_cancellation_refund(db: Session, creq: CancellationRequest,
+                                  booking: Booking, refund) -> None:
+    """Remboursement CONFIRMÉ par Stripe (status=succeeded). Idempotent. Sans commit."""
+    if creq.status == "refunded":
+        return
+    rid = refund["id"]
+    amount_cents = int(refund["amount"])
+    pi_id = refund.get("payment_intent") or booking.stripe_payment_intent_id
+    amount = _money(amount_cents)
+
+    if not db.query(PaymentTransaction).filter(
+        PaymentTransaction.stripe_refund_id == rid
+    ).first():
+        total = Decimal(str(booking.total)) or Decimal("1")
+        fee = (Decimal(str(booking.platform_fee or 0)) * amount / total
+               ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        _add_ledger(db, booking, "refund", amount, fee, amount - fee,
+                    payment_intent=pi_id, refund_id=rid,
+                    note=f"Refund: cancellation request #{creq.id}")
+    db.flush()
+
+    total_cents = compute_split(booking.total)[0]
+    booking.status = "refunded" if ledger_refunded_cents(db, booking.id) >= total_cents else "cancelled"
+
+    creq.status = "refunded"
+    creq.stripe_refund_id = rid
+    creq.refunded_amount = amount
+    creq.processed_at = datetime.utcnow()
+    creq.failure_reason = None
+
+    _notify(db, creq.user_id, "Refund completed",
+            f"{_format_money(amount, booking.currency)} has been refunded for booking "
+            f"#{booking.id}. Your booking is cancelled.",
+            f"/#/booking/{booking.id}", f"cancel-{creq.id}-refunded")
+
+def _fail_cancellation(db: Session, creq: CancellationRequest, booking: Booking, reason: str) -> None:
+    """Remboursement refusé/échoué chez Stripe. Sans commit."""
+    if creq.status != "processing":
+        return
+    creq.status = "failed"
+    creq.failure_reason = (reason or "Refund failed")[:255]
+    creq.processed_at = datetime.utcnow()
+    _notify(db, creq.user_id, "Refund could not be completed",
+            f"The refund for booking #{booking.id} could not be completed. "
+            "Our team will try again.",
+            f"/#/booking/{booking.id}", f"cancel-{creq.id}-failed-{creq.attempts}")
+    _notify_admins(db, f"Refund failed — request #{creq.id}",
+                   f"Booking #{booking.id}: {creq.failure_reason}",
+                   f"cancel-{creq.id}-failed-{creq.attempts}")
+
+def _settle_refund(db: Session, creq: CancellationRequest, booking: Booking, refund) -> None:
+    """Applique l'état réel d'un objet Refund Stripe à la demande."""
+    status_ = refund.get("status")
+    if refund.get("id") and not creq.stripe_refund_id:
+        creq.stripe_refund_id = refund["id"]
+    if status_ == "succeeded":
+        _complete_cancellation_refund(db, creq, booking, refund)
+    elif status_ in ("failed", "canceled"):
+        _fail_cancellation(db, creq, booking,
+                           refund.get("failure_reason") or f"Stripe refund {status_}")
+    # "pending" : on attend le webhook refund.updated / charge.refunded
+
+def _settle_refund_event(db: Session, refund) -> None:
+    """Webhook refund.* : met à jour la demande liée (si le remboursement en vient)."""
+    try:
+        request_id = int((refund.get("metadata") or {}).get("cancellation_request_id"))
+    except (TypeError, ValueError):
+        return
+    creq = db.query(CancellationRequest).filter(
+        CancellationRequest.id == request_id
+    ).with_for_update().first()
+    if not creq or creq.status != "processing":
+        return
+    booking = db.query(Booking).filter(Booking.id == creq.booking_id).with_for_update().first()
+    if booking:
+        _settle_refund(db, creq, booking, refund)
+
+@app.get("/api/bookings/{booking_id}/cancellation-preview")
+def cancellation_preview(
+    booking_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Montant réellement remboursable si le client annule maintenant (calculé côté serveur)."""
+    booking = db.query(Booking).filter(Booking.id == booking_id).first()
+    if not booking:
+        raise HTTPException(404, "Booking not found")
+    if booking.user_id != user.id:
+        raise HTTPException(403, "You don't have access to this booking")
+    now = datetime.now()
+    listing, arrival, percent, hours, total_cents, already, refundable = \
+        _cancellation_context(db, booking, now)
+
+    reason = None
+    if booking.status != "paid":
+        reason = "Only paid bookings can be cancelled through a request"
+    elif arrival <= now:
+        reason = "Your stay has already started"
+    elif db.query(CancellationRequest).filter(
+        CancellationRequest.booking_id == booking.id,
+        CancellationRequest.status.in_(ACTIVE_CANCELLATION_STATUSES),
+    ).first():
+        reason = "A cancellation request already exists for this booking"
+
+    return {
+        "eligible": reason is None,
+        "reason": reason,
+        "refund_percent": percent,
+        "hours_before_arrival": round(hours, 2),
+        "arrival_at": arrival.isoformat(),
+        "total_paid": float(_money(total_cents)),
+        "already_refunded": float(_money(already)),
+        "refundable_amount": float(_money(refundable)),
+        "currency": booking.currency,
+    }
+
+@app.post("/api/bookings/{booking_id}/cancellation-request")
+def request_cancellation(
+    booking_id: int,
+    req: CancellationCreate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    # Verrou : deux clics / deux onglets ne peuvent pas créer deux demandes
+    booking = db.query(Booking).filter(Booking.id == booking_id).with_for_update().first()
+    if not booking:
+        raise HTTPException(404, "Booking not found")
+    if booking.user_id != user.id:
+        raise HTTPException(403, "You don't have access to this booking")
+    if booking.status != "paid":
+        raise HTTPException(400, "Only paid bookings can be cancelled through a request")
+    if db.query(CancellationRequest).filter(
+        CancellationRequest.booking_id == booking.id,
+        CancellationRequest.status.in_(ACTIVE_CANCELLATION_STATUSES),
+    ).first():
+        raise HTTPException(409, "A cancellation request already exists for this booking")
+
+    now = datetime.now()
+    listing, arrival, percent, hours, total_cents, already, refundable = \
+        _cancellation_context(db, booking, now)
+    if arrival <= now:
+        raise HTTPException(400, "Your stay has already started")
+
+    creq = CancellationRequest(
+        booking_id=booking.id,
+        user_id=user.id,
+        status="pending",
+        reason=(req.reason or "").strip()[:2000] or None,
+        hours_before_arrival=Decimal(str(round(hours, 2))),
+        refund_percent=percent,
+        total_paid=_money(total_cents),
+        already_refunded=_money(already),
+        refundable_amount=_money(refundable),
+        currency=booking.currency,
+    )
+    db.add(creq)
+    db.flush()
+
+    title = listing.title if listing else f"booking #{booking.id}"
+    _notify(db, user.id, "Cancellation request received",
+            f"Your request for {title} is waiting for review. Estimated refund: "
+            f"{_format_money(_money(refundable), booking.currency)} ({percent}%).",
+            f"/#/booking/{booking.id}", f"cancel-{creq.id}-created")
+    _notify_admins(db, f"New cancellation request — booking #{booking.id}",
+                   f"{user.first_name} {user.last_name} asks to cancel {title}. "
+                   f"Refund rate {percent}%.",
+                   f"cancel-{creq.id}-created")
+    db.commit()
+    _flush_post_commit(db)
+    return serialize_cancellation(creq, booking, listing)
+
+@app.get("/api/cancellations")
+def my_cancellations(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Historique des demandes d'annulation du client connecté."""
+    rows = db.query(CancellationRequest).filter(
+        CancellationRequest.user_id == user.id
+    ).order_by(CancellationRequest.id.desc()).all()
+    result = []
+    for c in rows:
+        booking = db.query(Booking).filter(Booking.id == c.booking_id).first()
+        listing = db.query(Listing).filter(Listing.id == booking.listing_id).first() if booking else None
+        result.append(serialize_cancellation(c, booking, listing))
+    return {"requests": result}
+
+@app.get("/api/admin/cancellations")
+def admin_cancellations(
+    status: Optional[str] = Query(None),
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    q = db.query(CancellationRequest)
+    if status:
+        if status not in ("pending", "approved", "rejected", "processing", "refunded", "failed"):
+            raise HTTPException(422, "Invalid status")
+        q = q.filter(CancellationRequest.status == status)
+    rows = q.order_by(CancellationRequest.id.desc()).limit(500).all()
+    result = []
+    for c in rows:
+        booking = db.query(Booking).filter(Booking.id == c.booking_id).first()
+        listing = db.query(Listing).filter(Listing.id == booking.listing_id).first() if booking else None
+        guest = db.query(User).filter(User.id == c.user_id).first()
+        result.append(serialize_cancellation(c, booking, listing, guest))
+    return {"requests": result}
+
+@app.post("/api/admin/cancellations/{request_id}/reject")
+def admin_reject_cancellation(
+    request_id: int,
+    req: AdminDecision,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    creq = db.query(CancellationRequest).filter(
+        CancellationRequest.id == request_id
+    ).with_for_update().first()
+    if not creq:
+        raise HTTPException(404, "Cancellation request not found")
+    if creq.status not in ("pending", "failed"):
+        raise HTTPException(409, "This request has already been processed")
+    booking = db.query(Booking).filter(Booking.id == creq.booking_id).first()
+
+    creq.status = "rejected"
+    creq.admin_id = admin.id
+    creq.admin_note = (req.note or "").strip()[:2000] or None
+    creq.decided_at = datetime.utcnow()
+    creq.processed_at = datetime.utcnow()
+    note = f" Note: {creq.admin_note}" if creq.admin_note else ""
+    _notify(db, creq.user_id, "Cancellation request declined",
+            f"Your cancellation request for booking #{creq.booking_id} was declined. "
+            f"Your booking remains active.{note}",
+            f"/#/booking/{creq.booking_id}", f"cancel-{creq.id}-rejected")
+    db.commit()
+    _flush_post_commit(db)
+    return serialize_cancellation(creq, booking)
+
+@app.post("/api/admin/cancellations/{request_id}/approve")
+def admin_approve_cancellation(
+    request_id: int,
+    req: AdminDecision,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Accepte la demande puis effectue un VRAI remboursement Stripe (Connect).
+
+    Phase 1 (verrouillée) : calcul sur l'état réel Stripe, statut « processing », commit.
+    Phase 2 : création du remboursement chez Stripe (reverse_transfer + refund_application_fee :
+              le transfert au Host et la commission sont repris au prorata).
+    Phase 3 (verrouillée) : le statut final n'est écrit que d'après la réponse/le webhook Stripe.
+    """
+    if not _stripe_configured():
+        raise HTTPException(500, "Stripe n'est pas configuré : STRIPE_SECRET_KEY introuvable dans le .env")
+
+    # ── Phase 1 ──
+    creq = db.query(CancellationRequest).filter(
+        CancellationRequest.id == request_id
+    ).with_for_update().first()
+    if not creq:
+        raise HTTPException(404, "Cancellation request not found")
+    if creq.status not in ("pending", "failed"):
+        raise HTTPException(409, "This request has already been processed")
+    booking = db.query(Booking).filter(Booking.id == creq.booking_id).with_for_update().first()
+    if not booking or booking.status != "paid":
+        raise HTTPException(409, "This booking is no longer in a refundable state")
+    pi_id = booking.stripe_payment_intent_id
+    if not pi_id:
+        raise HTTPException(409, "No Stripe payment is attached to this booking")
+
+    try:
+        existing = _find_request_refund(pi_id, creq.id)
+        already_cents = _stripe_refunded_cents(pi_id)
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe lookup failed for cancellation {creq.id}: {e}")
+        raise HTTPException(502, "Could not verify the payment with Stripe. Please try again.")
+
+    total_cents = compute_split(booking.total)[0]
+    entitled = policy_refund_cents(total_cents, creq.refund_percent)
+    to_refund = max(0, min(entitled - already_cents, total_cents - already_cents))
+    if existing:
+        to_refund = int(existing["amount"])
+
+    creq.admin_id = admin.id
+    creq.admin_note = (req.note or "").strip()[:2000] or None
+    creq.decided_at = datetime.utcnow()
+    creq.failure_reason = None
+    creq.attempts = (creq.attempts or 0) + 1
+    creq.already_refunded = _money(already_cents)
+    note = f" Note: {creq.admin_note}" if creq.admin_note else ""
+
+    # Rien à rembourser (0 % ou déjà remboursé) : on annule sans appeler Stripe
+    if not existing and to_refund == 0:
+        creq.status = "approved"
+        creq.approved_amount = Decimal("0.00")
+        creq.refunded_amount = Decimal("0.00")
+        creq.processed_at = datetime.utcnow()
+        booking.status = "refunded" if already_cents >= total_cents else "cancelled"
+        _notify(db, creq.user_id, "Cancellation approved",
+                f"Your booking #{booking.id} is cancelled. No additional refund is due "
+                f"under the cancellation policy.{note}",
+                f"/#/booking/{booking.id}", f"cancel-{creq.id}-approved")
+        db.commit()
+        _flush_post_commit(db)
+        return serialize_cancellation(creq, booking)
+
+    creq.status = "processing"
+    creq.approved_amount = _money(to_refund)
+    _notify(db, creq.user_id, "Cancellation approved",
+            f"Your cancellation was approved. A refund of "
+            f"{_format_money(_money(to_refund), booking.currency)} is being processed.{note}",
+            f"/#/booking/{booking.id}", f"cancel-{creq.id}-approved-{creq.attempts}")
+    db.commit()
+    _flush_post_commit(db)
+
+    # ── Phase 2 : appel Stripe (hors verrou) ──
+    try:
+        if existing:
+            refund = existing
+        else:
+            refund = stripe.Refund.create(
+                payment_intent=pi_id,
+                amount=to_refund,
+                reverse_transfer=True,          # reprend la part du Host
+                refund_application_fee=True,    # rembourse la commission au prorata
+                metadata={
+                    "cancellation_request_id": str(creq.id),
+                    "booking_id": str(booking.id),
+                },
+                idempotency_key=f"cancel-req-{creq.id}-attempt-{creq.attempts}",
+            )
+    except (stripe.error.APIConnectionError, stripe.error.APIError) as e:
+        # Issue incertaine : la demande reste « processing » (voir /sync et le webhook)
+        logger.error(f"Stripe refund outcome unknown for cancellation {creq.id}: {e}")
+        raise HTTPException(
+            502, "Stripe did not answer. The refund may be in progress: use Sync in a minute.")
+    except stripe.error.StripeError as e:
+        logger.error(f"Stripe refund failed for cancellation {creq.id}: {e}")
+        db.rollback()
+        creq = db.query(CancellationRequest).filter(
+            CancellationRequest.id == request_id
+        ).with_for_update().populate_existing().first()
+        booking = db.query(Booking).filter(Booking.id == creq.booking_id).with_for_update().first()
+        msg = getattr(e, "user_message", None) or str(e)
+        _fail_cancellation(db, creq, booking, msg)
+        db.commit()
+        _flush_post_commit(db)
+        raise HTTPException(502, f"Refund failed: {msg}")
+
+    # ── Phase 3 : état réel (le webhook a pu passer entre-temps) ──
+    creq = db.query(CancellationRequest).filter(
+        CancellationRequest.id == request_id
+    ).with_for_update().populate_existing().first()
+    booking = db.query(Booking).filter(Booking.id == creq.booking_id).with_for_update().populate_existing().first()
+    if not creq.stripe_refund_id:
+        creq.stripe_refund_id = refund["id"]
+    _settle_refund(db, creq, booking, refund)
+    db.commit()
+    _flush_post_commit(db)
+    return serialize_cancellation(creq, booking)
+
+@app.post("/api/admin/cancellations/{request_id}/sync")
+def admin_sync_cancellation(
+    request_id: int,
+    req: AdminDecision,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Relit chez Stripe l'état d'un remboursement « en cours » (webhook manqué, timeout…)."""
+    if not _stripe_configured():
+        raise HTTPException(500, "Stripe n'est pas configuré : STRIPE_SECRET_KEY introuvable dans le .env")
+    creq = db.query(CancellationRequest).filter(
+        CancellationRequest.id == request_id
+    ).with_for_update().first()
+    if not creq:
+        raise HTTPException(404, "Cancellation request not found")
+    if creq.status != "processing":
+        raise HTTPException(409, "Only requests in progress can be synchronized")
+    booking = db.query(Booking).filter(Booking.id == creq.booking_id).with_for_update().first()
+    try:
+        refund = None
+        if creq.stripe_refund_id:
+            refund = stripe.Refund.retrieve(creq.stripe_refund_id)
+        elif booking and booking.stripe_payment_intent_id:
+            refund = _find_request_refund(booking.stripe_payment_intent_id, creq.id)
+    except stripe.error.StripeError as e:
+        raise HTTPException(502, f"Stripe error: {getattr(e, 'user_message', None) or str(e)}")
+
+    if refund is not None:
+        _settle_refund(db, creq, booking, refund)
+    else:
+        if creq.decided_at and (datetime.utcnow() - creq.decided_at).total_seconds() < 120:
+            raise HTTPException(409, "The refund is still being created, try again in a minute")
+        # Stripe ne connaît aucun remboursement pour cette demande : échec réel
+        _fail_cancellation(db, creq, booking, "No refund was created at Stripe")
+    db.commit()
+    _flush_post_commit(db)
+    return serialize_cancellation(creq, booking)
 
 # ─── Host Listings ─────────────────────────────────────────────
 
@@ -936,6 +1606,15 @@ def create_listing(
         beds=req.beds,
         bathrooms=req.bathrooms,
         property_type=req.property_type,
+        check_in_time=req.check_in_time,
+        check_out_time=req.check_out_time,
+        pets_allowed=req.pets_allowed,
+        smoking_allowed=req.smoking_allowed,
+        parties_allowed=req.parties_allowed,
+        events_allowed=req.events_allowed,
+        children_allowed=req.children_allowed,
+        arrival_instructions=(req.arrival_instructions or "").strip()[:5000] or None,
+        additional_rules=(req.additional_rules or "").strip()[:5000] or None,
         status="draft",
     )
     db.add(listing)
@@ -968,6 +1647,15 @@ def update_listing(
     update_data = req.model_dump(exclude_unset=True)
     amenity_ids = update_data.pop("amenity_ids", None)
     image_urls = update_data.pop("image_urls", None)
+
+    # Règles du logement : champs NOT NULL, jamais remis à NULL
+    for _k in ("check_in_time", "check_out_time", "pets_allowed", "smoking_allowed",
+               "parties_allowed", "events_allowed", "children_allowed"):
+        if _k in update_data and update_data[_k] is None:
+            update_data.pop(_k)
+    for _k in ("arrival_instructions", "additional_rules"):
+        if _k in update_data:
+            update_data[_k] = (update_data[_k] or "").strip()[:5000] or None
 
     # Publication : uniquement si le propriétaire a un compte Stripe Connect valide,
     # vérifié en direct auprès de Stripe (jamais sur la seule foi du frontend).
@@ -1014,6 +1702,113 @@ def delete_listing(
     db.delete(listing)
     db.commit()
     return {"message": "Listing deleted"}
+
+# ─── Host Calendar (blocage / déblocage des dates) ─────────────
+
+def _owned_listing(db: Session, listing_id: int, user: User) -> Listing:
+    listing = db.query(Listing).filter(Listing.id == listing_id).first()
+    if not listing:
+        raise HTTPException(404, "Listing not found")
+    if listing.owner_id != user.id and user.role != "admin":
+        raise HTTPException(403, "You don't own this listing")
+    return listing
+
+def _blocked_dates_list(db: Session, listing_id: int) -> List[str]:
+    rows = db.query(BlockedDate).filter(
+        BlockedDate.listing_id == listing_id
+    ).order_by(BlockedDate.blocked_on.asc()).all()
+    return [r.blocked_on.isoformat() for r in rows]
+
+@app.get("/api/host/listings/{listing_id}/calendar")
+def host_listing_calendar(
+    listing_id: int,
+    user: User = Depends(require_host),
+    db: Session = Depends(get_db),
+):
+    """Dates bloquées par le Host + réservations actives (en attente / payées)."""
+    _owned_listing(db, listing_id, user)
+    bookings = db.query(Booking).filter(
+        Booking.listing_id == listing_id,
+        Booking.status.in_(["pending", "paid"]),
+        Booking.check_out >= date.today(),
+    ).order_by(Booking.check_in.asc()).all()
+    return {
+        "blocked": _blocked_dates_list(db, listing_id),
+        "bookings": [
+            {
+                "id": b.id,
+                "check_in": b.check_in.isoformat(),
+                "check_out": b.check_out.isoformat(),
+                "status": b.status,
+            }
+            for b in bookings
+        ],
+    }
+
+@app.post("/api/host/listings/{listing_id}/calendar/block")
+def host_block_dates(
+    listing_id: int,
+    req: BlockDatesRequest,
+    user: User = Depends(require_host),
+    db: Session = Depends(get_db),
+):
+    _owned_listing(db, listing_id, user)
+    dates = sorted(set(req.dates))
+    if not dates:
+        raise HTTPException(422, "No dates provided")
+    if len(dates) > 366:
+        raise HTTPException(422, "Too many dates at once (max 366)")
+    today = date.today()
+    if any(d < today for d in dates):
+        raise HTTPException(400, "Past dates cannot be blocked")
+
+    # Impossible de bloquer une nuit déjà réservée (en attente ou payée)
+    active = db.query(Booking).filter(
+        Booking.listing_id == listing_id,
+        Booking.status.in_(["pending", "paid"]),
+        Booking.check_in <= dates[-1],
+        Booking.check_out > dates[0],
+    ).all()
+    for d in dates:
+        for b in active:
+            if b.check_in <= d < b.check_out:
+                raise HTTPException(409, "Some of these dates are already booked")
+
+    existing = {
+        r.blocked_on for r in db.query(BlockedDate).filter(
+            BlockedDate.listing_id == listing_id,
+            BlockedDate.blocked_on.in_(dates),
+        ).all()
+    }
+    for d in dates:
+        if d not in existing:
+            db.add(BlockedDate(listing_id=listing_id, blocked_on=d))
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "Please try again")
+    return {"blocked": _blocked_dates_list(db, listing_id)}
+
+@app.post("/api/host/listings/{listing_id}/calendar/unblock")
+def host_unblock_dates(
+    listing_id: int,
+    req: BlockDatesRequest,
+    user: User = Depends(require_host),
+    db: Session = Depends(get_db),
+):
+    _owned_listing(db, listing_id, user)
+    dates = sorted(set(req.dates))
+    if not dates:
+        raise HTTPException(422, "No dates provided")
+    if len(dates) > 366:
+        raise HTTPException(422, "Too many dates at once (max 366)")
+    db.query(BlockedDate).filter(
+        BlockedDate.listing_id == listing_id,
+        BlockedDate.blocked_on.in_(dates),
+    ).delete(synchronize_session=False)
+    db.commit()
+    return {"blocked": _blocked_dates_list(db, listing_id)}
 
 # ─── Host Bookings (reservations received) ─────────────────────
 
@@ -1078,18 +1873,26 @@ def create_review(
         raise HTTPException(403, "You can only review your own bookings")
     if booking.status != "paid":
         raise HTTPException(400, "You can only review completed stays")
+    # Avis possible uniquement une fois le séjour terminé (date de départ atteinte)
+    if booking.check_out > date.today():
+        raise HTTPException(400, "You can only review after your stay has ended")
     existing = db.query(Review).filter(Review.booking_id == req.booking_id).first()
     if existing:
         raise HTTPException(409, "You have already reviewed this booking")
+    comment = (req.comment or "").strip()[:2000] or None
     review = Review(
         user_id=user.id,
         listing_id=booking.listing_id,
         booking_id=req.booking_id,
         rating=req.rating,
-        comment=req.comment,
+        comment=comment,
     )
     db.add(review)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(409, "You have already reviewed this booking")
     db.refresh(review)
     return serialize_review(review)
 
@@ -1265,6 +2068,7 @@ def _handle_stripe_event(db: Session, event) -> None:
                 if r.get("status") not in ("succeeded", "pending"):
                     continue
                 rid = r["id"]
+                _settle_refund_event(db, r)   # demande d'annulation liée (idempotent)
                 if db.query(PaymentTransaction).filter(
                     PaymentTransaction.stripe_refund_id == rid
                 ).first():
@@ -1276,6 +2080,10 @@ def _handle_stripe_event(db: Session, event) -> None:
                             payment_intent=pi_id, refund_id=rid, note="Refund")
             if obj.get("refunded"):
                 booking.status = "refunded"
+
+    elif event_type in ("refund.created", "refund.updated", "refund.failed",
+                        "charge.refund.updated"):
+        _settle_refund_event(db, obj)
 
     elif event_type == "account.updated":
         acct_id = obj.get("id")
@@ -1656,6 +2464,66 @@ def unread_notification_count(
     ).count()
     return {"count": count}
 
+# ─── Invitations à laisser un avis (fin de séjour) ─────────────
+
+REVIEW_INVITE_INTERVAL_SECONDS = int(os.getenv("REVIEW_INVITE_INTERVAL_SECONDS", "3600"))
+
+def _send_review_invitations() -> int:
+    """Notifie (une seule fois par réservation) les clients dont le séjour est terminé
+    et qui n'ont pas encore laissé d'avis. Retourne le nombre de notifications créées."""
+    db = SessionLocal()
+    sent = 0
+    try:
+        today = date.today()
+        reviewed = {
+            r[0] for r in db.query(Review.booking_id).filter(
+                Review.booking_id.isnot(None)
+            ).all()
+        }
+        bookings = db.query(Booking).filter(
+            Booking.status == "paid",
+            Booking.check_out <= today,
+        ).all()
+        for b in bookings:
+            if b.id in reviewed:
+                continue
+            try:
+                listing = db.query(Listing).filter(Listing.id == b.listing_id).first()
+                if not listing:
+                    continue
+                notif = create_notification(
+                    db, b.user_id, "review",
+                    f"How was your stay at {listing.title}?",
+                    "Your stay is over. Share your experience by leaving a rating and a comment.",
+                    f"/#/booking/{b.id}",
+                    dedup_key=f"review-invite-{b.id}",
+                )
+                if notif is None:
+                    continue  # invitation déjà envoyée
+                db.commit()
+                db.refresh(notif)
+                _queue_post_commit(db, "notification", b.user_id, notif)
+                _flush_post_commit(db)
+                sent += 1
+            except Exception as e:
+                db.rollback()
+                db.info.pop("post_commit", None)
+                logger.warning(f"Review invitation failed for booking {b.id}: {e}")
+    finally:
+        db.close()
+    return sent
+
+async def _review_invite_loop() -> None:
+    await asyncio.sleep(10)  # laisse le schéma / la base se préparer au démarrage
+    while True:
+        try:
+            sent = await asyncio.to_thread(_send_review_invitations)
+            if sent:
+                logger.info(f"Sent {sent} review invitation(s)")
+        except Exception as e:
+            logger.warning(f"Review invitation loop error: {e}")
+        await asyncio.sleep(REVIEW_INVITE_INTERVAL_SECONDS)
+
 # ─── WebSocket: real-time ──────────────────────────────────────
 
 # Connexions actives : user_id → set de WebSockets
@@ -1742,10 +2610,24 @@ def ensure_schema():
             "users": [
                 ("language", "VARCHAR(5) NOT NULL DEFAULT 'en'"),
                 ("host_bio", "TEXT NULL"),
+                ("totp_secret", "VARCHAR(64) NULL"),
+                ("totp_enabled", "BOOLEAN NOT NULL DEFAULT 0"),
+                ("totp_last_step", "BIGINT NOT NULL DEFAULT 0"),
             ],
             "bookings": [
                 ("platform_fee", "DECIMAL(10,2) NOT NULL DEFAULT 0"),
                 ("host_amount", "DECIMAL(10,2) NOT NULL DEFAULT 0"),
+            ],
+            "listings": [
+                ("check_in_time", "VARCHAR(5) NOT NULL DEFAULT '15:00'"),
+                ("check_out_time", "VARCHAR(5) NOT NULL DEFAULT '11:00'"),
+                ("pets_allowed", "BOOLEAN NOT NULL DEFAULT 0"),
+                ("smoking_allowed", "BOOLEAN NOT NULL DEFAULT 0"),
+                ("parties_allowed", "BOOLEAN NOT NULL DEFAULT 0"),
+                ("events_allowed", "BOOLEAN NOT NULL DEFAULT 0"),
+                ("children_allowed", "BOOLEAN NOT NULL DEFAULT 1"),
+                ("arrival_instructions", "TEXT NULL"),
+                ("additional_rules", "TEXT NULL"),
             ],
         }
         with engine.begin() as conn:
@@ -1776,6 +2658,16 @@ def fix_seed_passwords():
         db.close()
     except Exception as e:
         logger.warning(f"Could not fix seed passwords (DB may not be up): {e}")
+
+# ─── Startup: invitations d'avis (tâche de fond) ───────────────
+
+_background_tasks: Set[asyncio.Task] = set()
+
+@app.on_event("startup")
+async def start_review_invitations():
+    task = asyncio.create_task(_review_invite_loop())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 if __name__ == "__main__":
     import uvicorn
